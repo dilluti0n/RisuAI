@@ -48,6 +48,8 @@ import { isTauri, isNodeServer, isCapacitor, isInStandaloneMode } from "./platfo
 
 export const forageStorage = new AutoStorage()
 
+const isElectron = typeof navigator !== 'undefined' && /electron/i.test(navigator.userAgent);
+
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 
 interface fetchLog {
@@ -108,7 +110,7 @@ let checkedPaths: string[] = []
 
 /**
  * Checks if a file exists in the Capacitor filesystem.
- * 
+ *
  * @param {CapFS.GetUriOptions} getUriOptions - The options for getting the URI of the file.
  * @returns {Promise<boolean>} - A promise that resolves to true if the file exists, false otherwise.
  */
@@ -127,7 +129,7 @@ async function checkCapFileExists(getUriOptions: CapFS.GetUriOptions): Promise<b
 
 /**
  * Gets the source URL of a file.
- * 
+ *
  * @param {string} loc - The location of the file.
  * @returns {Promise<string>} - A promise that resolves to the source URL of the file.
  */
@@ -234,7 +236,7 @@ let appDataDirPath = ''
 
 /**
  * Reads an image file and returns its data.
- * 
+ *
  * @param {string} data - The path to the image file.
  * @returns {Promise<Uint8Array>} - A promise that resolves to the data of the image file.
  */
@@ -255,7 +257,7 @@ export async function readImage(data: string) {
 
 /**
  * Saves an asset file with the given data, custom ID, and file name.
- * 
+ *
  * @param {Uint8Array} data - The data of the asset file.
  * @param {string} [customId=''] - The custom ID for the asset file.
  * @param {string} [fileName=''] - The name of the asset file.
@@ -295,7 +297,7 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
 
 /**
  * Loads an asset file with the given ID.
- * 
+ *
  * @param {string} id - The ID of the asset file to load.
  * @returns {Promise<Uint8Array>} - A promise that resolves to the data of the loaded asset file.
  */
@@ -315,7 +317,7 @@ export let saving = $state({
 
 /**
  * Saves the current state of the database.
- * 
+ *
  * @returns {Promise<void>} - A promise that resolves when the database has been saved.
  */
 export let requiresFullEncoderReload = $state({
@@ -497,7 +499,7 @@ export async function saveDb() {
 
 /**
  * Retrieves the database backups.
- * 
+ *
  * @returns {Promise<number[]>} - A promise that resolves to an array of backup timestamps.
  */
 export async function getDbBackups() {
@@ -545,8 +547,222 @@ export function setUsingSw(value: boolean) {
 }
 
 /**
+ * Loads the application data.
+ *
+ * @returns {Promise<void>} - A promise that resolves when the data has been loaded.
+ */
+export async function loadData() {
+    const loaded = get(loadedStore)
+    if (!loaded) {
+        try {
+            if (isTauri) {
+                LoadingStatusState.text = "Checking Files..."
+                appWindow.maximize()
+                if (!await exists('', { baseDir: BaseDirectory.AppData })) {
+                    await mkdir('', { baseDir: BaseDirectory.AppData })
+                }
+                if (!await exists('database', { baseDir: BaseDirectory.AppData })) {
+                    await mkdir('database', { baseDir: BaseDirectory.AppData })
+                }
+                if (!await exists('assets', { baseDir: BaseDirectory.AppData })) {
+                    await mkdir('assets', { baseDir: BaseDirectory.AppData })
+                }
+                if (!await exists('database/database.bin', { baseDir: BaseDirectory.AppData })) {
+                    await writeFile('database/database.bin', encodeRisuSaveLegacy({}), { baseDir: BaseDirectory.AppData });
+                }
+                try {
+                    LoadingStatusState.text = "Reading Save File..."
+                    const readed = await readFile('database/database.bin', { baseDir: BaseDirectory.AppData })
+                    LoadingStatusState.text = "Cleaning Unnecessary Files..."
+                    getDbBackups() //this also cleans the backups
+                    LoadingStatusState.text = "Decoding Save File..."
+                    const decoded = await decodeRisuSave(readed)
+                    setDatabase(decoded)
+                } catch (error) {
+                    LoadingStatusState.text = "Reading Backup Files..."
+                    const backups = await getDbBackups()
+                    let backupLoaded = false
+                    for (const backup of backups) {
+                        if (!backupLoaded) {
+                            try {
+                                LoadingStatusState.text = `Reading Backup File ${backup}...`
+                                const backupData = await readFile(`database/dbbackup-${backup}.bin`, { baseDir: BaseDirectory.AppData })
+                                setDatabase(
+                                    await decodeRisuSave(backupData)
+                                )
+                                backupLoaded = true
+                            } catch (error) {
+                                console.error(error)
+                            }
+                        }
+                    }
+                    if (!backupLoaded) {
+                        throw "Your save file is corrupted"
+                    }
+                }
+                LoadingStatusState.text = "Checking Update..."
+                await checkRisuUpdate()
+                await changeFullscreen()
+
+            }
+            else {
+                await forageStorage.Init()
+
+                LoadingStatusState.text = "Loading Local Save File..."
+                let gotStorage: Uint8Array = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
+                LoadingStatusState.text = "Decoding Local Save File..."
+                if (checkNullish(gotStorage)) {
+                    gotStorage = encodeRisuSaveLegacy({})
+                    await forageStorage.setItem('database/database.bin', gotStorage)
+                }
+                try {
+                    const decoded = await decodeRisuSave(gotStorage)
+                    console.log(decoded)
+                    setDatabase(decoded)
+                } catch (error) {
+                    console.error(error)
+                    const backups = await getDbBackups()
+                    let backupLoaded = false
+                    for (const backup of backups) {
+                        try {
+                            LoadingStatusState.text = `Reading Backup File ${backup}...`
+                            const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
+                            setDatabase(
+                                await decodeRisuSave(backupData)
+                            )
+                            backupLoaded = true
+                        } catch (error) { }
+                    }
+                    if (!backupLoaded) {
+                        throw "Forage: Your save file is corrupted"
+                    }
+                }
+
+                if (await forageStorage.checkAccountSync()) {
+                    LoadingStatusState.text = "Checking Account Sync..."
+                    let gotStorage: Uint8Array = await (forageStorage.realStorage as AccountStorage).getItem('database/database.bin', (v) => {
+                        LoadingStatusState.text = `Loading Remote Save File ${(v * 100).toFixed(2)}%`
+                    })
+                    if (checkNullish(gotStorage)) {
+                        gotStorage = encodeRisuSaveLegacy({})
+                        await forageStorage.setItem('database/database.bin', gotStorage)
+                    }
+                    try {
+                        setDatabase(
+                            await decodeRisuSave(gotStorage)
+                        )
+                    } catch (error) {
+                        const backups = await getDbBackups()
+                        let backupLoaded = false
+                        for (const backup of backups) {
+                            try {
+                                LoadingStatusState.text = `Reading Backup File ${backup}...`
+                                const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
+                                setDatabase(
+                                    await decodeRisuSave(backupData)
+                                )
+                                backupLoaded = true
+                            } catch (error) { }
+                        }
+                        if (!backupLoaded) {
+                            // throw "Your save file is corrupted"
+                            await autoServerBackup()
+                            await sleep(10000)
+                        }
+                    }
+                }
+                LoadingStatusState.text = "Rechecking Account Sync..."
+                await forageStorage.checkAccountSync()
+                LoadingStatusState.text = "Checking Drive Sync..."
+                const isDriverMode = await checkDriverInit()
+                if (isDriverMode) {
+                    return
+                }
+                LoadingStatusState.text = "Checking Service Worker..."
+
+                if(navigator.serviceWorker && (!Capacitor.isNativePlatform() && !isElectron)){
+                    usingSw = true
+                    await registerSw()
+                }
+                else {
+                    usingSw = false
+                }
+                if (getDatabase().didFirstSetup) {
+                    characterURLImport()
+                }
+            }
+            LoadingStatusState.text = "Checking Unnecessary Files..."
+            try {
+                await pargeChunks()
+            } catch (error) {
+                console.error(error)
+            }
+            LoadingStatusState.text = "Loading Plugins..."
+            try {
+                await loadPlugins()
+            } catch (error) { }
+            if (getDatabase().account) {
+                LoadingStatusState.text = "Checking Account Data..."
+                try {
+                    await loadRisuAccountData()
+                } catch (error) { }
+            }
+            try {
+                //@ts-ignore
+                const isInStandaloneMode = (window.matchMedia('(display-mode: standalone)').matches) || (window.navigator.standalone) || document.referrer.includes('android-app://');
+                if (isInStandaloneMode) {
+                    await navigator.storage.persist()
+                }
+            } catch (error) {
+
+            }
+            LoadingStatusState.text = "Checking For Format Update..."
+            await checkNewFormat()
+            const db = getDatabase();
+
+            LoadingStatusState.text = "Updating States..."
+            updateColorScheme()
+            updateTextThemeAndCSS()
+            updateAnimationSpeed()
+            updateHeightMode()
+            updateErrorHandling()
+            updateGuisize()
+            if (!localStorage.getItem('nightlyWarned') && window.location.hostname === 'nightly.risuai.xyz') {
+                alertMd(language.nightlyWarning)
+                await waitAlert()
+                //for testing, leave empty
+                localStorage.setItem('nightlyWarned', '')
+            }
+            if (db.botSettingAtStart) {
+                botMakerMode.set(true)
+            }
+            if ((db.betaMobileGUI && window.innerWidth <= 800) || import.meta.env.VITE_RISU_LITE === 'TRUE') {
+                initMobileGesture()
+                MobileGUI.set(true)
+            }
+            loadedStore.set(true)
+            selectedCharID.set(-1)
+            startObserveDom()
+            assignIds()
+            makeColdData()
+            saveDb()
+            moduleUpdate()
+            if (import.meta.env.VITE_RISU_TOS === 'TRUE') {
+                alertTOS().then((a) => {
+                    if (a === false) {
+                        location.reload()
+                    }
+                })
+            }
+        } catch (error) {
+            alertError(error)
+        }
+    }
+}
+
+/**
  * Retrieves fetch data for a given chat ID.
- * 
+ *
  * @param {string} id - The chat ID to search for in the fetch log.
  * @returns {fetchLog | null} - The fetch log entry if found, otherwise null.
  */
@@ -563,7 +779,7 @@ const knownHostes = ["localhost", "127.0.0.1", "0.0.0.0"];
 
 /**
  * Interface representing the arguments for the global fetch function.
- * 
+ *
  * @interface GlobalFetchArgs
  * @property {boolean} [plainFetchForce] - Whether to force plain fetch.
  * @property {any} [body] - The body of the request.
@@ -588,7 +804,7 @@ interface GlobalFetchArgs {
 
 /**
  * Interface representing the result of the global fetch function.
- * 
+ *
  * @interface GlobalFetchResult
  * @property {boolean} ok - Whether the request was successful.
  * @property {any} data - The data returned from the request.
@@ -603,7 +819,7 @@ interface GlobalFetchResult {
 
 /**
  * Adds a fetch log entry.
- * 
+ *
  * @param {Object} arg - The arguments for the fetch log entry.
  * @param {any} arg.body - The body of the request.
  * @param {{ [key: string]: string }} [arg.headers] - The headers of the request.
@@ -638,52 +854,51 @@ export function addFetchLog(arg: {
     return 0;
 }
 
-/**
- * Performs a global fetch request.
- * 
- * @param {string} url - The URL to fetch.
- * @param {GlobalFetchArgs} [arg={}] - The arguments for the fetch request.
- * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
- */
-export async function globalFetch(url: string, arg: GlobalFetchArgs = {}): Promise<GlobalFetchResult> {
+  /**
+   * Performs a global fetch request.
+   *
+   * @param {string} url - The URL to fetch.
+   * @param {GlobalFetchArgs} [arg={}] - The arguments for the fetch request.
+   * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
+   */
+  export async function globalFetch(url: string, arg: GlobalFetchArgs = {}): Promise<GlobalFetchResult> {
     try {
-        const db = getDatabase();
-        const method = arg.method ?? "POST";
-        db.requestmet = "normal";
+      const db = getDatabase();
+      const method = arg.method ?? "POST";
+      db.requestmet = "normal";
 
-        if (arg.abortSignal?.aborted) { return { ok: false, data: 'aborted', headers: {}, status: 400 }; }
+      if (arg.abortSignal?.aborted) { return { ok: false, data: 'aborted', headers: {}, status: 400 }; }
+      const urlHost = new URL(url).hostname
+      const forcePlainFetch = isElectron ||
+        ((knownHostes.includes(urlHost) && !isTauri) || db.usePlainFetch || arg.plainFetchForce) && !arg.plainFetchDeforce
 
-        const urlHost = new URL(url).hostname
-        const forcePlainFetch = ((knownHostes.includes(urlHost) && !isTauri) || db.usePlainFetch || arg.plainFetchForce) && !arg.plainFetchDeforce
+      if (knownHostes.includes(urlHost) && !isTauri && !isNodeServer && !isElectron) {
+        return { ok: false, headers: {}, status:400, data: 'You are trying local request on web version. This is not allowed due to browser security policy. Use the desktop version instead, or use a tunneling service like ngrok and set the CORS to allow all.' };
+      }
 
-        if (knownHostes.includes(urlHost) && !isTauri && !isNodeServer) {
-            return { ok: false, headers: {}, status: 400, data: 'You are trying local request on web version. This is not allowed due to browser security policy. Use the desktop version instead, or use a tunneling service like ngrok and set the CORS to allow all.' };
-        }
-
-        if (forcePlainFetch) {
-            return await fetchWithPlainFetch(url, arg);
-        }
-        //userScriptFetch is provided by userscript
-        if (window.userScriptFetch) {
-            return await fetchWithUSFetch(url, arg);
-        }
-        if (isTauri) {
-            return await fetchWithTauri(url, arg);
-        }
-        if (isCapacitor) {
-            return await fetchWithCapacitor(url, arg);
-        }
-        return await fetchWithProxy(url, arg);
-
+      if (forcePlainFetch) {
+        return await fetchWithPlainFetch(url, arg);
+      }
+      //userScriptFetch is provided by userscript
+      if (window.userScriptFetch) {
+        return await fetchWithUSFetch(url, arg);
+      }
+      if (isTauri) {
+        return await fetchWithTauri(url, arg);
+      }
+      if (Capacitor.isNativePlatform()) {
+        return await fetchWithCapacitor(url, arg);
+      }
+      return await fetchWithProxy(url, arg);
     } catch (error) {
-        console.error(error);
-        return { ok: false, data: `${error}`, headers: {}, status: 400 };
+      console.error(error);
+      return { ok: false, data: `${error}`, headers: {}, status: 400 };
     }
-}
+  }
 
 /**
  * Adds a fetch log entry in the global fetch log.
- * 
+ *
  * @param {any} response - The response data.
  * @param {boolean} success - Indicates if the fetch was successful.
  * @param {string} url - The URL of the fetch request.
@@ -722,7 +937,7 @@ function addFetchLogInGlobalFetch(response: any, success: boolean, url: string, 
 
 /**
  * Performs a fetch request using plain fetch.
- * 
+ *
  * @param {string} url - The URL to fetch.
  * @param {GlobalFetchArgs} arg - The arguments for the fetch request.
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
@@ -742,7 +957,7 @@ async function fetchWithPlainFetch(url: string, arg: GlobalFetchArgs): Promise<G
 
 /**
  * Performs a fetch request using userscript provided fetch.
- * 
+ *
  * @param {string} url - The URL to fetch.
  * @param {GlobalFetchArgs} arg - The arguments for the fetch request.
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
@@ -762,7 +977,7 @@ async function fetchWithUSFetch(url: string, arg: GlobalFetchArgs): Promise<Glob
 
 /**
  * Performs a fetch request using Tauri.
- * 
+ *
  * @param {string} url - The URL to fetch.
  * @param {GlobalFetchArgs} arg - The arguments for the fetch request.
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
@@ -799,7 +1014,7 @@ async function fetchWithCapacitor(url: string, arg: GlobalFetchArgs): Promise<Gl
 
 /**
  * Performs a fetch request using a proxy.
- * 
+ *
  * @param {string} url - The URL to fetch.
  * @param {GlobalFetchArgs} arg - The arguments for the fetch request.
  * @returns {Promise<GlobalFetchResult>} - The result of the fetch request.
@@ -851,15 +1066,31 @@ async function fetchWithProxy(url: string, arg: GlobalFetchArgs): Promise<Global
 }
 
 /**
+ * Registers the service worker and initializes it.
+ *
+ * @returns {Promise<void>} - A promise that resolves when the service worker is registered and initialized.
+ */
+async function registerSw() {
+    await navigator.serviceWorker.register("/sw.js", {
+        scope: "/"
+    });
+    await sleep(100);
+    const da = await fetch('/sw/init');
+    if (!(da.status >= 200 && da.status < 300)) {
+        location.reload();
+    }
+}
+
+/**
  * Regular expression to match backslashes.
- * 
+ *
  * @constant {RegExp}
  */
 const re = /\\/g;
 
 /**
  * Gets the basename of a given path.
- * 
+ *
  * @param {string} data - The path to get the basename from.
  * @returns {string} - The basename of the path.
  */
@@ -871,7 +1102,7 @@ export function getBasename(data: string) {
 
 /**
  * Retrieves unpargeable resources from the database.
- * 
+ *
  * @param {Database} db - The database to retrieve unpargeable resources from.
  * @param {'basename'|'pure'} [uptype='basename'] - The type of unpargeable resources to retrieve.
  * @returns {string[]} - An array of unpargeable resources.
@@ -881,7 +1112,7 @@ export function getUnpargeables(db: Database, uptype: 'basename' | 'pure' = 'bas
 
     /**
      * Adds a resource to the unpargeable list if it is not already included.
-     * 
+     *
      * @param {string} data - The resource to add.
      */
     function addUnparge(data: string) {
@@ -958,7 +1189,7 @@ export function getUnpargeables(db: Database, uptype: 'basename' | 'pure' = 'bas
 
 /**
  * Replaces database resources with the provided replacer object.
- * 
+ *
  * @param {Database} db - The database object containing resources to be replaced.
  * @param {{[key: string]: string}} replacer - An object mapping original resource keys to their replacements.
  * @returns {Database} - The updated database object with replaced resources.
@@ -968,7 +1199,7 @@ export function replaceDbResources(db: Database, replacer: { [key: string]: stri
 
     /**
      * Replaces a given data string with its corresponding value from the replacer object.
-     * 
+     *
      * @param {string} data - The data string to be replaced.
      * @returns {string} - The replaced data string or the original data if no replacement is found.
      */
@@ -1000,6 +1231,137 @@ export function replaceDbResources(db: Database, replacer: { [key: string]: stri
         }
     }
     return db;
+}
+
+/**
+ * Checks and updates the database format to the latest version.
+ *
+ * @returns {Promise<void>} - A promise that resolves when the database format check and update is complete.
+ */
+async function checkNewFormat(): Promise<void> {
+    let db = getDatabase();
+
+    // Check data integrity
+    db.characters = db.characters.map((v) => {
+        if (!v) {
+            return null;
+        }
+        v.chaId ??= uuidv4();
+        v.type ??= 'character';
+        v.chatPage ??= 0;
+        v.chats ??= [];
+        v.customscript ??= [];
+        v.firstMessage ??= '';
+        v.globalLore ??= [];
+        v.name ??= '';
+        v.viewScreen ??= 'none';
+        v.emotionImages = v.emotionImages ?? [];
+
+        if (v.type === 'character') {
+            v.bias ??= [];
+            v.characterVersion ??= '';
+            v.creator ??= '';
+            v.desc ??= '';
+            v.utilityBot ??= false;
+            v.tags ??= [];
+            v.systemPrompt ??= '';
+            v.scenario ??= '';
+        }
+        return v;
+    }).filter((v) => {
+        return v !== null;
+    });
+
+    db.modules = (db.modules ?? []).map((v) => {
+        if (v?.lorebook) {
+            v.lorebook = updateLorebooks(v.lorebook);
+        }
+        return v
+    }).filter((v) => {
+        return v !== null && v !== undefined;
+    });
+
+    db.personas = (db.personas ?? []).map((v) => {
+        v.id ??= uuidv4()
+        return v
+    }).filter((v) => {
+        return v !== null && v !== undefined;
+    });
+
+    if (!db.formatversion) {
+        function checkParge(data: string) {
+
+            if (data.startsWith('assets') || (data.length < 3)) {
+                return data
+            }
+            else {
+                const d = 'assets/' + (data.replace(/\\/g, '/').split('assets/')[1])
+                if (!d) {
+                    return data
+                }
+                return d;
+            }
+        }
+
+        db.customBackground = checkParge(db.customBackground);
+        db.userIcon = checkParge(db.userIcon);
+
+        for (let i = 0; i < db.characters.length; i++) {
+            if (db.characters[i].image) {
+                db.characters[i].image = checkParge(db.characters[i].image);
+            }
+            if (db.characters[i].emotionImages) {
+                for (let i2 = 0; i2 < db.characters[i].emotionImages.length; i2++) {
+                    if (db.characters[i].emotionImages[i2] && db.characters[i].emotionImages[i2].length >= 2) {
+                        db.characters[i].emotionImages[i2][1] = checkParge(db.characters[i].emotionImages[i2][1]);
+                    }
+                }
+            }
+        }
+
+        db.formatversion = 2;
+    }
+    if (db.formatversion < 3) {
+        for (let i = 0; i < db.characters.length; i++) {
+            let cha = db.characters[i];
+            if (cha.type === 'character') {
+                if (checkNullish(cha.sdData)) {
+                    cha.sdData = defaultSdDataFunc();
+                }
+            }
+        }
+
+        db.formatversion = 3;
+    }
+    if (db.formatversion < 4) {
+        //migration removed due to issues
+        db.formatversion = 4;
+    }
+    if (db.formatversion < 5) {
+        if (db.loreBookToken < 8000) {
+            db.loreBookToken = 8000;
+        }
+        db.formatversion = 5;
+    }
+    if (!db.characterOrder) {
+        db.characterOrder = [];
+    }
+    if (db.mainPrompt === oldMainPrompt) {
+        db.mainPrompt = defaultMainPrompt;
+    }
+    if (db.mainPrompt === oldJailbreak) {
+        db.mainPrompt = defaultJailbreak;
+    }
+    for (let i = 0; i < db.characters.length; i++) {
+        const trashTime = db.characters[i].trashTime;
+        const targetTrashTime = trashTime ? trashTime + 1000 * 60 * 60 * 24 * 3 : 0;
+        if (trashTime && targetTrashTime < Date.now()) {
+            db.characters.splice(i, 1);
+            i--;
+        }
+    }
+    setDatabase(db);
+    checkCharOrder();
 }
 
 /**
@@ -1074,7 +1436,7 @@ export function checkCharOrder() {
 
 /**
  * Retrieves the request log as a formatted string.
- * 
+ *
  * @returns {string} The formatted request log.
  */
 export function getRequestLog() {
@@ -1100,7 +1462,7 @@ export function getFetchLogs() {
 
 /**
  * Opens a URL in the appropriate environment.
- * 
+ *
  * @param {string} url - The URL to open.
  */
 export function openURL(url: string) {
@@ -1114,7 +1476,7 @@ export function openURL(url: string) {
 
 /**
  * Converts FormData to a URL-encoded string.
- * 
+ *
  * @param {FormData} formData - The FormData to convert.
  * @returns {string} The URL-encoded string.
  */
@@ -1128,6 +1490,62 @@ function formDataToString(formData: FormData): string {
     return params.join('&');
 }
 
+//Assigns unique IDs to chara and chat
+function assignIds() {
+    if (!DBState?.db?.characters) {
+        return
+    }
+    const assignedIds = new Set<string>()
+    for (let i = 0; i < DBState.db.characters.length; i++) {
+        const cha = DBState.db.characters[i]
+        if (!cha.chaId) {
+            cha.chaId = uuidv4()
+        }
+        if (assignedIds.has(cha.chaId)) {
+            console.warn(`Duplicate chaId found: ${cha.chaId}. Assigning new ID.`);
+            cha.chaId = uuidv4();
+        }
+        assignedIds.add(cha.chaId)
+        for (let i2 = 0; i2 < cha.chats.length; i2++) {
+            const chat = cha.chats[i2]
+            if (!chat.id) {
+                chat.id = uuidv4()
+            }
+            if (assignedIds.has(chat.id)) {
+                console.warn(`Duplicate chat ID found: ${chat.id}. Assigning new ID.`);
+                chat.id = uuidv4();
+            }
+            assignedIds.add(chat.id)
+        }
+    }
+
+}
+
+/**
+ * Gets the maximum context length for a given model.
+ *
+ * @param {string} model - The model name.
+ * @returns {number|undefined} The maximum context length, or undefined if the model is not recognized.
+ */
+export function getModelMaxContext(model: string): number | undefined {
+    if (model.startsWith('gpt35')) {
+        if (model.includes('16k')) {
+            return 16000
+        }
+        return 4000
+    }
+    if (model.startsWith('gpt4')) {
+        if (model.includes('turbo')) {
+            return 128000
+        }
+        if (model.includes('32k')) {
+            return 32000
+        }
+        return 8000
+    }
+
+    return undefined
+}
 /**
  * A writer class for Tauri environment.
  */
@@ -1137,7 +1555,7 @@ export class TauriWriter {
 
     /**
      * Creates an instance of TauriWriter.
-     * 
+     *
      * @param {string} path - The file path to write to.
      */
     constructor(path: string) {
@@ -1146,7 +1564,7 @@ export class TauriWriter {
 
     /**
      * Writes data to the file.
-     * 
+     *
      * @param {Uint8Array} data - The data to write.
      */
     async write(data: Uint8Array) {
@@ -1173,7 +1591,7 @@ class MobileWriter {
 
     /**
      * Creates an instance of MobileWriter.
-     * 
+     *
      * @param {string} path - The file path to write to.
      */
     constructor(path: string) {
@@ -1182,7 +1600,7 @@ class MobileWriter {
 
     /**
      * Writes data to the file.
-     * 
+     *
      * @param {Uint8Array} data - The data to write.
      */
     async write(data: Uint8Array) {
@@ -1225,7 +1643,7 @@ export class LocalWriter {
 
     /**
      * Initializes the writer.
-     * 
+     *
      * @param {string} [name='Binary'] - The name of the file.
      * @param {string[]} [ext=['bin']] - The file extensions.
      * @returns {Promise<boolean>} - A promise that resolves to a boolean indicating success.
@@ -1256,7 +1674,7 @@ export class LocalWriter {
 
     /**
      * Writes backup data to the file.
-     * 
+     *
      * @param {string} name - The name of the backup.
      * @param {Uint8Array} data - The data to write.
      */
@@ -1272,7 +1690,7 @@ export class LocalWriter {
 
     /**
      * Writes data to the file.
-     * 
+     *
      * @param {Uint8Array} data - The data to write.
      */
     async write(data: Uint8Array): Promise<void> {
@@ -1295,7 +1713,7 @@ export class VirtualWriter {
 
     /**
      * Writes data to the buffer.
-     * 
+     *
      * @param {Uint8Array} data - The data to write.
      */
     write(data: Uint8Array): void {
@@ -1505,14 +1923,14 @@ export class AppendableBuffer {
  * @returns {ReadableStream<Uint8Array>} - The new readable stream.
  */
 const pipeFetchLog = (fetchLogIndex: number, readableStream: ReadableStream<Uint8Array>) => {
-    
+
     const splited = readableStream.tee();
-    
+
     (async () => {
         const text = await (new Response(splited[0])).text()
         fetchLog[fetchLogIndex].response = text
     })()
-    
+
     return splited[1]
 }
 
@@ -1720,7 +2138,7 @@ export async function fetchNative(url: string, arg: {
 
 /**
  * Converts a ReadableStream of Uint8Array to a text string.
- * 
+ *
  * @param {ReadableStream<Uint8Array>} stream - The readable stream to convert.
  * @returns {Promise<string>} A promise that resolves to the text content of the stream.
  */
@@ -1742,7 +2160,7 @@ export function toggleFullscreen() {
 
 /**
  * Removes non-Latin characters from a string, replaces multiple spaces with a single space, and trims the string.
- * 
+ *
  * @param {string} data - The input string to be processed.
  * @returns {string} The processed string with non-Latin characters removed, multiple spaces replaced by a single space, and trimmed.
  */
@@ -1753,8 +2171,39 @@ export function trimNonLatin(data: string) {
 }
 
 /**
+ * Updates the height mode of the document based on the value stored in the database.
+ *
+ * The height mode can be one of the following values: 'auto', 'vh', 'dvh', 'lvh', 'svh', or 'percent'.
+ * The corresponding CSS variable '--risu-height-size' is set accordingly.
+ */
+export function updateHeightMode() {
+    const db = getDatabase()
+    const root = document.querySelector(':root') as HTMLElement;
+    switch (db.heightMode) {
+        case 'auto':
+            root.style.setProperty('--risu-height-size', '100%');
+            break
+        case 'vh':
+            root.style.setProperty('--risu-height-size', '100vh');
+            break
+        case 'dvh':
+            root.style.setProperty('--risu-height-size', '100dvh');
+            break
+        case 'lvh':
+            root.style.setProperty('--risu-height-size', '100lvh');
+            break
+        case 'svh':
+            root.style.setProperty('--risu-height-size', '100svh');
+            break
+        case 'percent':
+            root.style.setProperty('--risu-height-size', '100%');
+            break
+    }
+}
+
+/**
  * A class that provides a blank writer implementation.
- * 
+ *
  * This class is used to provide a no-op implementation of a writer, making it compatible with other writer interfaces.
  */
 export class BlankWriter {
@@ -1763,7 +2212,7 @@ export class BlankWriter {
 
     /**
      * Initializes the writer.
-     * 
+     *
      * This method does nothing and is provided for compatibility with other writer interfaces.
      */
     async init() {
@@ -1772,9 +2221,9 @@ export class BlankWriter {
 
     /**
      * Writes data to the writer.
-     * 
+     *
      * This method does nothing and is provided for compatibility with other writer interfaces.
-     * 
+     *
      * @param {string} key - The key associated with the data.
      * @param {Uint8Array|string} data - The data to be written.
      */
@@ -1784,7 +2233,7 @@ export class BlankWriter {
 
     /**
      * Ends the writing process.
-     * 
+     *
      * This method does nothing and is provided for compatibility with other writer interfaces.
      */
     async end() {
@@ -1853,7 +2302,7 @@ export class PerformanceDebugger {
 
     /**
      * Ends the timing measurement and records the time difference.
-     * 
+     *
      * @param {string} key - The key to associate with the recorded time.
     */
     endAndRecord(key: string) {
@@ -1866,7 +2315,7 @@ export class PerformanceDebugger {
 
     /**
      * Ends the timing measurement, records the time difference, and starts a new timing measurement.
-     * 
+     *
      * @param {string} key - The key to associate with the recorded time.
     */
     endAndRecordAndStart(key: string) {
@@ -1955,7 +2404,7 @@ export function toGetter<T extends object>(
         get(target, prop, receiver) {
 
             const realInstance = getterFn();
-            
+
             if (args?.restrictChildren && args.restrictChildren.includes(prop as string)) {
                 throw new Error(`Access to property '${String(prop)}' is restricted`);
             }
@@ -2014,7 +2463,7 @@ const countriesWithAiLaw = new Set<string>([
     // EU
     // AI Act
     // https://artificialintelligenceact.eu/
-    
+
     "AT",
     "BE",
     "BG",
@@ -2044,9 +2493,9 @@ const countriesWithAiLaw = new Set<string>([
     "ES",
     "SE",
 
-    //China 
+    //China
     //Measures for Labeling of AI-Generated Synthetic Content
-    // 关于印发《人工智能生成合成内容标识办法》的通知 
+    // 关于印发《人工智能生成合成内容标识办法》的通知
     // https://www.cac.gov.cn/2025-03/14/c_1743654684782215.htm
     "CN",
 
@@ -2057,7 +2506,7 @@ const countriesWithAiLaw = new Set<string>([
     //TW isn't under mainland china jurisdiction
     //de facto, de jure in TW law, unlike HK and MO,
     //So we don't include it for now
-    //"TW", 
+    //"TW",
 
     // Republic of Korea
     // AI Basic Act

@@ -6,7 +6,6 @@ import { BaseDirectory, exists, readFile, readDir, writeFile } from "@tauri-apps
 import { language } from "../../lang";
 import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
-import { hubURL } from "../characterCards";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
 
 export async function checkDriver(type:'save'|'load'|'loadtauri'|'savetauri'|'reftoken'){
